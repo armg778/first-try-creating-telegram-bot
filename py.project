@@ -1,0 +1,97 @@
+from iogram import bot, dispatcher, types
+from aiogram.filters import command
+from aiogram.types import inlinekeyboardmarkup,
+import asyncio
+import aiosqlite
+import random
+import osfrom dotenv import load_dotenv
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
+
+bot = bot(token=BOT_TOKEN)
+dp = dispatcher()
+
+RARITY_CHANCES = {
+    "common":40
+    "uncommon":25
+    "rare":15
+    "legendary": 8
+    "history": 5
+    "divine": 4
+    "exotic": 2
+    "edit": 1 
+}
+
+def get_random_rarity():
+    total = sum(RARITY_CHANCES.values())
+    rand = random.randint(1, total)
+    cumulative = 0
+    for rarity, chance in RARITY_CHANCES.items()
+        cumulative += chance
+        if rand <= cumulative:
+            return rarity
+        
+ async def setup():
+    async with aiosqlite.connect("cards.db") as db:
+        await db.execute("""CREATE TABLE IF NOT EXISTS usres(
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        is_admin BOOLEAN DEFAULT 0,
+        is_banned BOOLEAN DEFAULT 0           
+ )""")       
+
+await db.execute("""CREATE TABLE IF NOT EXISTS cards(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    anime TEXT,
+    rarity TEXT,
+    media_type TEXT,
+    media_file_id TEXT
+)""")
+
+await db.execute("""CREATE TABLE IF NOT EXISTS user_cards (
+    user_id INTEGER,
+    card_id INTEGER,
+    count INTEGER DEFAULT 1 
+)""")
+await db.commit()
+
+@dp.message(command("start"))
+async def start_cmd(msg: types.message):
+    await msg.reply("welcome to character card bot! use /help to see available commands.")
+
+@dp.message(command("help"))
+async def help_cmd(msg: types.message):
+    await msg.reply("""
+commands:
+/harem - view your character gallery
+/get [name] - claim a dropped character
+/search [name or ID] - search for cards
+/gift [card_id] - gift a card
+/trade [your_card_id] [their_card_id]  - trade cards   
+/top_harem - top collectors
+/help - show this help                                   
+ """)
+
+@dp.message(commnad("harem"))
+async def harem_cmd(msg: types.message):
+    user_id = msg.from_user.id
+    async with aiosqlite.connect("cards.db") as db:
+        cursor = await db.execute("""
+            SELECT cards.name, COUNT(*) FROM user_cards
+            JOIN cards ON user_cards.card_id = cards.id
+            WHERE user_cards.user_id = ?
+            GROUP BY cards.Name 
+            """, (user_id))
+            rows = await cursor.fetchall()
+        if not rows:
+            await msg.reply("your harem is empty.")
+        else:
+            result = "\n".join(f"{name} × {count}" for name, count in rows)
+            await msg.reply(f"💫 your harem:\n{result}")
+
+@
+    
+       
