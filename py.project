@@ -1,590 +1,50 @@
-# card_bot_full_project
-
-# ➔ پوشه ها:
-# - bot_main.py ⇒ فایل اصلی
-# - handlers/
-#     - user.py
-#     - admin.py
-#     - owner.py
-#     - messages.py
-# - database/
-#     - db.py
-#     - models.py
-# - utils/
-#     - rarity.py
-#     - cooldown.py
-#     - decorators.py
-# - data/
-#     - cards.json
-#     - users.json
-
-# =========================================
-# ===> bot_main.py
-import logging
-from aiogram import Bot, Dispatcher, executor, types
-from database import db
-from handlers import user, admin, owner, messages
-
-API_TOKEN = 'YOUR_BOT_TOKEN_HERE'
-logging.basicConfig(level=logging.INFO)
-
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
-
-db.init()
-
-# Register handlers
-def register_all_handlers(dp):
-    user.register(dp)
-    admin.register(dp)
-    owner.register(dp)
-    messages.register(dp)
-
-register_all_handlers(dp)
-
-if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
-
-# =========================================
-# ===> database/db.py
-import sqlite3
-
-conn = sqlite3.connect('data/database.db')
-cursor = conn.cursor()
-
-def init():
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-                        id INTEGER PRIMARY KEY,
-                        username TEXT,
-                        is_admin INTEGER DEFAULT 0,
-                        is_owner INTEGER DEFAULT 0,
-                        is_banned INTEGER DEFAULT 0,
-                        message_count INTEGER DEFAULT 0,
-                        last_msgs TEXT,
-                        harem TEXT DEFAULT '')''')
-
-    cursor.execute('''CREATE TABLE IF NOT EXISTS cards (
-                        id INTEGER PRIMARY KEY,
-                        name TEXT,
-                        anime TEXT,
-                        rarity TEXT,
-                        media_id TEXT,
-                        is_video INTEGER DEFAULT 0)''')
-    conn.commit()
-
-def get_cursor():
-    return conn, cursor
-
-# =========================================
-# ===> database/models.py
-from database.db import get_cursor
-import json
-
-class User:
-    @staticmethod
-    def get(user_id):
-        conn, cur = get_cursor()
-        res = cur.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-        if res:
-            return dict(zip([column[0] for column in cur.description], res))
-        return None
-
-    @staticmethod
-    def add(user_id, username):
-        conn, cur = get_cursor()
-        cur.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (user_id, username))
-        conn.commit()
-
-    @staticmethod
-    def update_column(user_id, column, value):
-        conn, cur = get_cursor()
-        cur.execute(f"UPDATE users SET {column}=? WHERE id=?", (value, user_id))
-        conn.commit()
-
-    @staticmethod
-    def increment(user_id, column):
-        conn, cur = get_cursor()
-        cur.execute(f"UPDATE users SET {column} = {column} + 1 WHERE id=?", (user_id,))
-        conn.commit()
-
-class Card:
-    @staticmethod
-    def add(name, anime, rarity, media_id, is_video):
-        conn, cur = get_cursor()
-        cur.execute("INSERT INTO cards (name, anime, rarity, media_id, is_video) VALUES (?, ?, ?, ?, ?)",
-                    (name, anime, rarity, media_id, is_video))
-        conn.commit()
-
-    @staticmethod
-    def get_all():
-        conn, cur = get_cursor()
-        return cur.execute("SELECT * FROM cards").fetchall()
-
-    @staticmethod
-    def get_by_id(card_id):
-        conn, cur = get_cursor()
-        return cur.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
-
-# =========================================
-# ===> utils/rarity.py
-import random
-
-def pick_rarity():
-    chances = {
-        'common': 40,
-        'uncommon': 25,
-        'rare': 15,
-        'legendary': 8,
-        'history': 5,
-        'divine': 4,
-        'exotic': 2,
-        'edit': 1
-    }
-    rarities = list(chances.keys())
-    weights = list(chances.values())
-    return random.choices(rarities, weights=weights, k=1)[0]
-
-rarity_emojis = {
-    'common': '⚪️',
-    'uncommon': '🟣',
-    'rare': '🟠',
-    'legendary': '🟡',
-    'history': '🔱',
-    'divine': '🌟',
-    'exotic': '💎',
-    'edit': '✨'
-}
-
-# =========================================
-# ===> utils/cooldown.py
-import time
-from database.models import User
-from database.db import get_cursor
-import json
-
-
-cooldowns = {}
-
-
-def check_spam(user_id, now):
-    user = User.get(user_id)
-    last_msgs = json.loads(user['last_msgs']) if user['last_msgs'] else []
-    last_msgs.append(now)
-    last_msgs = last_msgs[-6:]  # keep only last 6
-    User.update_column(user_id, 'last_msgs', json.dumps(last_msgs))
-
-    if len(last_msgs) >= 6 and (last_msgs[-1] - last_msgs[0]) <= 20:
-        User.update_column(user_id, 'is_banned', 1)
-        cooldowns[user_id] = now + 1200  # 20 minutes
-        return True
-
-    if len(last_msgs) >= 4 and (last_msgs[-1] - last_msgs[-4]) <= 8:
-        User.update_column(user_id, 'is_banned', 1)
-        cooldowns[user_id] = now + 1200
-        return True
-
-    return False
-
-
-def is_banned(user_id):
-    now = time.time()
-    if user_id in cooldowns:
-        if cooldowns[user_id] > now:
-            return True
-        else:
-            User.update_column(user_id, 'is_banned', 0)
-            cooldowns.pop(user_id)
-            return False
-    return False
-
-# =========================================
-# ===> handlers/messages.py
-from aiogram import types, Dispatcher
-from database.models import User, Card
-from utils.cooldown import check_spam, is_banned
-from utils.rarity import pick_rarity, rarity_emojis
-import time, random
-
-user_msg_count = {}
-
-def register(dp: Dispatcher):
-    @dp.message_handler()
-    async def count_msg(msg: types.Message):
-        uid = msg.from_user.id
-        now = time.time()
-
-        if is_banned(uid):
-            await msg.reply("You are banned")
-            return
-
-        User.add(uid, msg.from_user.username)
-        check_spam(uid, now)
-
-        user_msg_count[uid] = user_msg_count.get(uid, 0) + 1
-
-        if user_msg_count[uid] >= 100:
-            rarity = pick_rarity()
-            cards = [c for c in Card.get_all() if c[3] == rarity]
-            if not cards:
-                return
-            card = random.choice(cards)
-            caption = f"{rarity_emojis[rarity]} ᴀ ᴄʜᴀʀᴀᴄᴛᴇʀ ʜᴀs sᴘᴀᴡɴᴇᴅ ɪɴ ᴛʜᴇ ᴄʜᴀᴛ!\n ᴀᴅᴅ ᴛʜɪs ᴄʜᴀʀᴀᴄᴛᴇʀ ᴛᴏ ʏᴏᴜʀ ʜᴀʀᴇᴍ ᴜsɪɴɢ /get {card[1]}"
-            if card[5]:
-                await msg.answer_video(card[4], caption=caption)
-            else:
-                await msg.answer_photo(card[4], caption=caption)
-            user_msg_count[uid] = 0
-
 card_bot/
-├── main.py
-├── config.py
-├── db.py
-├── card_manager.py
-├── user_manager.py
-├── drop_system.py
-├── admin_commands.py
-├── owner_commands.py
-├── utils.py
-└── assets/
-    └── cards/
-
-
-TOKEN = 'YOUR_BOT_TOKEN'
-OWNER_ID = 123456789  # عددی تلگرام شما
-CHANNEL_USERNAME = "@get_your_character"
-DROP_RATE_LIMIT = 100  # هر 100 پیام یک دراپ
-
-
-import sqlite3
-
-def init_db():
-    conn = sqlite3.connect('card_bot.db')
-    c = conn.cursor()
-
-    # Users
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            username TEXT,
-            is_banned INTEGER DEFAULT 0,
-            message_count INTEGER DEFAULT 0,
-            last_messages TEXT DEFAULT '',
-            last_drop_time INTEGER DEFAULT 0
-        )
-    ''')
-
-    # Cards
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS cards (
-            id INTEGER PRIMARY KEY,
-            name TEXT,
-            anime TEXT,
-            rarity TEXT,
-            file_id TEXT,
-            file_type TEXT
-        )
-    ''')
-
-    # User Cards
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_cards (
-            user_id INTEGER,
-            card_id INTEGER,
-            count INTEGER DEFAULT 1,
-            UNIQUE(user_id, card_id)
-        )
-    ''')
-
-    # Admins
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY
-        )
-    ''')
-
-    conn.commit()
-    conn.close()
-
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
-from db import init_db
-from user_manager import handle_user_message
-from card_manager import command_get, command_harem, command_search
-from admin_commands import *
-from owner_commands import *
-
-def main():
-    init_db()
-    updater = Updater(token=config.TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    # پیام‌ها
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_user_message))
-
-    # دستورات کاربران
-    dp.add_handler(CommandHandler("get", command_get))
-    dp.add_handler(CommandHandler("harem", command_harem))
-    dp.add_handler(CommandHandler("search", command_search))
-
-    # دستورات ادمین‌ها
-    dp.add_handler(CommandHandler("add_card", add_card))
-    dp.add_handler(CommandHandler("del_card", del_card))
-    dp.add_handler(CommandHandler("card_stats", card_stats))
-    dp.add_handler(CommandHandler("list_cards", list_cards))
-
-    # دستورات مالک
-    dp.add_handler(CommandHandler("add_admin", add_admin))
-    dp.add_handler(CommandHandler("remove_admin", remove_admin))
-    dp.add_handler(CommandHandler("transfer", transfer_harem))
-    dp.add_handler(CommandHandler("delete_card", delete_user_card))
-
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == '__main__':
-    main()
-
-pip install pyrogram tgcrypto motor pymongo python-dotenv
-
-cardbot/
-│
-├── main.py
-├── config.py
-├── db.py
-├── utils.py
+├── bot.py
+├── database.py
 ├── handlers/
 │   ├── user.py
 │   ├── admin.py
-│   ├── owner.py
-│   └── dropper.py
-├── data/
-│   └── cards.json
-├── .env
+│   └── owner.py
+├── models/
+│   └── models.py
+├── utils/
+│   └── rarity.py
+└── data/
+    └── cards.json
 
-
-BOT_TOKEN=توکن_ربات
-API_ID=api_id_تلگرام
-API_HASH=api_hash_تلگرام
-MONGO_URI=mongodb://localhost:27017
-OWNER_ID=123456789
-CHANNEL_USERNAME=@get_your_character
-
-
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-MONGO_URI = os.getenv("MONGO_URI")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
-RARITY_CHANCES = {
-    "common": 40,
-    "uncommon": 25,
-    "rare": 15,
-    "legendary": 8,
-    "history": 5,
-    "divine": 4,
-    "exotic": 2,
-    "edit": 1,
-}
-RARITY_ICONS = {
-    "common": "⚪️",
-    "uncommon": "🟣",
-    "rare": "🟠",
-    "legendary": "🟡",
-    "history": "🔱",
-    "divine": "🌟",
-    "exotic": "💎",
-    "edit": "✨",
-}
-
-
-from motor.motor_asyncio import AsyncIOMotorClient
-from config import MONGO_URI
-
-mongo = AsyncIOMotorClient(MONGO_URI)
-db = mongo["cardbot"]
-
-users_col = db["users"]
-cards_col = db["cards"]
-drops_col = db["drops"]
-banned_col = db["banned"]
-admins_col = db["admins"]
-
-
-import random
-from config import RARITY_CHANCES
-
-def weighted_random_rarity():
-    rand = random.randint(1, 100)
-    total = 0
-    for rarity, chance in RARITY_CHANCES.items():
-        total += chance
-        if rand <= total:
-            return rarity
-    return "common"
-
+pip install pyrogram tgcrypto
 
 from pyrogram import Client
-from config import BOT_TOKEN, API_ID, API_HASH
-from handlers import user, admin, owner, dropper
+from handlers import user, admin, owner
 
-bot = Client("cardbot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+app = Client("card_bot", api_id=123456, api_hash="your_api_hash", bot_token="your_bot_token")
 
-bot.add_handler(user.handler)
-bot.add_handler(admin.handler)
-bot.add_handler(owner.handler)
-bot.add_handler(dropper.handler)
+# Register handlers
+user.register(app)
+admin.register(app)
+owner.register(app)
 
-bot.run()
+if __name__ == "__main__":
+    print("Bot is running...")
+    app.run()
 
+import json
+from pathlib import Path
 
-from pyrogram import filters, Client
-from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
-from db import users_col, cards_col, drops_col, banned_col
-from config import CHANNEL_USERNAME, RARITY_ICONS
+DB_PATH = Path("data/cards.json")
 
-handler = []  # We will register handlers to this list later
+def load_cards():
+    if DB_PATH.exists():
+        with open(DB_PATH, "r") as f:
+            return json.load(f)
+    return {"cards": [], "users": {}, "banned": []}
 
-async def is_banned(user_id):
-    return await banned_col.find_one({"_id": user_id}) is not None
+def save_cards(data):
+    with open(DB_PATH, "w") as f:
+        json.dump(data, f, indent=4)
 
-@Client.on_message(filters.command("harem") & filters.private)
-async def harem_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    if await is_banned(user_id):
-        return await message.reply("🚫 You are banned")
+import random
 
-    member = await client.get_chat_member(CHANNEL_USERNAME, user_id)
-    if not member or member.status == "left":
-        return await message.reply("Please join our channel first: {}".format(CHANNEL_USERNAME))
-
-    user_data = await users_col.find_one({"_id": user_id})
-    if not user_data or not user_data.get("harem"):
-        return await message.reply("You have no characters in your harem yet!")
-
-    harem_list = user_data["harem"]
-    text = "💖 Your Harem:\n\n"
-    for card in harem_list:
-        card_data = await cards_col.find_one({"_id": card})
-        if card_data:
-            emoji = RARITY_ICONS.get(card_data['rarity'], '')
-            text += f"{emoji} {card_data['name']} - {card_data['anime']}\n"
-
-    await message.reply(text)
-
-
-@Client.on_message(filters.command("get") & filters.private)
-async def get_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    if await is_banned(user_id):
-        return await message.reply("🚫 You are banned")
-
-    try:
-        card_name = message.text.split(" ", 1)[1].strip().lower()
-    except IndexError:
-        return await message.reply("Please use the format: /get [card name]")
-
-    active_drop = await drops_col.find_one({"active": True})
-    if not active_drop:
-        return await message.reply("No active character drop right now.")
-
-    if active_drop['claimed']:
-        return await message.reply("This character has already been claimed!")
-
-    card = await cards_col.find_one({"_id": active_drop['card_id']})
-    if card_name != card['name'].lower():
-        return await message.reply("Wrong card name!")
-
-    await users_col.update_one({"_id": user_id}, {"$addToSet": {"harem": card['_id']}}, upsert=True)
-    await drops_col.update_one({"_id": active_drop['_id']}, {"$set": {"claimed": True, "claimer": user_id}})
-
-    reply_text = f"You got it!\nName: {card['name']}\nAnime: {card['anime']}\nRarity: {card['rarity'].capitalize()}"
-    await message.reply(reply_text)
-
-
-@Client.on_message(filters.command("search") & filters.private)
-async def search_handler(client: Client, message: Message):
-    query = message.text.split(" ", 1)[1].strip().lower()
-    results = cards_col.find({"$or": [{"name": {"$regex": query, "$options": "i"}}, {"anime": {"$regex": query, "$options": "i"}}]})
-
-    text = "🔍 Search Results:\n\n"
-    async for card in results:
-        text += f"{card['_id']}: {card['name']} - {card['anime']}\n"
-    await message.reply(text or "No cards found.")
-
-
-@Client.on_message(filters.command("gift") & filters.private & filters.reply)
-async def gift_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    if await is_banned(user_id):
-        return await message.reply("🚫 You are banned")
-
-    try:
-        card_id = int(message.text.split()[1])
-    except (IndexError, ValueError):
-        return await message.reply("Please specify a valid card ID.")
-
-    recipient = message.reply_to_message.from_user
-    user_data = await users_col.find_one({"_id": user_id})
-    if not user_data or card_id not in user_data.get("harem", []):
-        return await message.reply("You don't own this card!")
-
-    await message.reply(f"Are you sure you want to gift this card to {recipient.mention}? Type 'yes' to confirm.")
-
-    @Client.on_message(filters.text & filters.private & filters.user(user_id))
-    async def confirm_gift(c, m):
-        if m.text.lower() == "yes":
-            await users_col.update_one({"_id": user_id}, {"$pull": {"harem": card_id}})
-            await users_col.update_one({"_id": recipient.id}, {"$addToSet": {"harem": card_id}}, upsert=True)
-            await m.reply("🎁 Gift sent!")
-        else:
-            await m.reply("❌ Gift cancelled.")
-
-
-@Client.on_message(filters.command("top_harem") & filters.private)
-async def top_handler(client: Client, message: Message):
-    cursor = users_col.find({"harem.0": {"$exists": True}})
-    top_users = []
-    async for user in cursor:
-        top_users.append((user["_id"], len(user.get("harem", []))))
-
-    top_users.sort(key=lambda x: x[1], reverse=True)
-    text = "🏆 Top Harems:\n\n"
-    for i, (uid, count) in enumerate(top_users[:10], 1):
-        text += f"{i}. User ID {uid} - {count} cards\n"
-
-    await message.reply(text or "No users have cards yet.")
-
-
-@Client.on_message(filters.command("help") & filters.private)
-async def help_handler(client: Client, message: Message):
-    await message.reply("""
-📜 User Commands:
-/harem - View your character gallery
-/get [name] - Claim a dropped character
-/search [name or ID] - Search for cards
-/gift [card_id] - Gift a card (must reply to user)
-/trade [your_card_id] [their_card_id] - Trade cards (must reply)
-/top_harem - Show users with the most cards
-/help - Show this help menu
-    """)
-
-from telegram import Update, InputMediaPhoto, InputMediaVideo
-from telegram.ext import ContextTypes
-import random, time
-
-# پیام‌های کاربران ذخیره می‌شود در این دیکشنری: {chat_id: {user_id: [timestamps]}}
-message_log = {}
-# تعداد پیام‌ها برای هر چت ذخیره می‌شود
-chat_message_count = {}
-# کاربران بن موقت‌شده ذخیره می‌شن
-soft_banned_users = {}  # {user_id: expire_timestamp}
-
-# ریرتی‌ها و درصدها و ایموجی‌ها
 RARITY_CHANCES = {
     "common": 40,
     "uncommon": 25,
@@ -595,462 +55,624 @@ RARITY_CHANCES = {
     "exotic": 2,
     "edit": 1
 }
+
 RARITY_EMOJIS = {
+    "common": "⚪️",
+    "uncommon": "🟣",
+    "rare": "🟠",
+    "legendary": "🟡",
+    "history": "🔱",
+    "divine": "🌟",
+    "exotic": "💎",
+    "edit": "✨"
+}
+
+def get_random_rarity():
+    pool = []
+    for rarity, chance in RARITY_CHANCES.items():
+        pool.extend([rarity] * chance)
+    return random.choice(pool)
+
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from database import load_cards, save_cards
+from utils.rarity import RARITY_EMOJIS
+import re
+
+def register(app: Client):
+    @app.on_message(filters.command("get") & filters.group)
+    def get_card(client: Client, message: Message):
+        data = load_cards()
+        user_id = str(message.from_user.id)
+        if user_id in data.get("banned", []):
+            return message.reply("You are banned")
+
+        if "drop" not in data:
+            return message.reply("No character has been dropped yet!")
+
+        if len(message.command) < 2:
+            return message.reply("Usage: /get [character_name]")
+
+        name = " ".join(message.command[1:]).strip().lower()
+        dropped = data["drop"]
+
+        if dropped["name"].lower() != name:
+            return message.reply("This character was not dropped!")
+
+        # Add card to user
+        if user_id not in data["users"]:
+            data["users"][user_id] = []
+        data["users"][user_id].append(dropped["id"])
+
+        rarity = dropped["rarity"]
+        emoji = RARITY_EMOJIS.get(rarity, "")
+
+        message.reply(f"You got it!\nname: {dropped['name']}\nAnime: {dropped['anime']}\nRarity: {rarity} {emoji}")
+        data.pop("drop")
+        save_cards(data)
+
+    @app.on_message(filters.command("harem") & filters.group)
+    def show_harem(client: Client, message: Message):
+        data = load_cards()
+        user_id = str(message.from_user.id)
+        if user_id in data.get("banned", []):
+            return message.reply("You are banned")
+
+        user_cards = data["users"].get(user_id, [])
+        if not user_cards:
+            return message.reply("You don't have any characters in your harem yet!")
+
+        card_map = {str(card["id"]): card for card in data["cards"]}
+        harem_list = []
+        for cid in user_cards:
+            card = card_map.get(str(cid))
+            if card:
+                emoji = RARITY_EMOJIS.get(card["rarity"], "")
+                harem_list.append(f"{card['id']}: {card['name']} ({card['anime']}) {emoji}")
+
+        harem_text = "\n".join(harem_list)
+        message.reply(f"Your Harem:\n{harem_text}")
+
+    @app.on_message(filters.command("search") & filters.group)
+    def search_card(client: Client, message: Message):
+        data = load_cards()
+        if len(message.command) < 2:
+            return message.reply("Usage: /search [name or id]")
+
+        query = " ".join(message.command[1:]).lower()
+        results = []
+        for card in data["cards"]:
+            if query in card["name"].lower() or query == str(card["id"]):
+                emoji = RARITY_EMOJIS.get(card["rarity"], "")
+                button = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Who Have?", callback_data=f"whohave_{card['id']}")
+                ]])
+                message.reply(f"{card['id']}: {card['name']}\n{card['anime']}\nRarity: {card['rarity']} {emoji}", reply_markup=button)
+                return
+
+        message.reply("Card not found.")
+
+    @app.on_callback_query(filters.regex(r"whohave_(\d+)"))
+    def who_have(client, callback_query):
+        data = load_cards()
+        card_id = callback_query.data.split("_")[1]
+        owners = []
+        for user_id, cards in data["users"].items():
+            count = cards.count(int(card_id))
+            if count:
+                owners.append((user_id, count))
+
+        if not owners:
+            return callback_query.message.edit_text("No one owns this card.")
+
+        owners_text = "\n".join([f"ID: {uid} - Count: {cnt}" for uid, cnt in owners[:15]])
+        callback_query.message.edit_text(f"Owners of card {card_id}:\n{owners_text}")
+
+
+# utils.py
+def find_card_by_id_or_name(session, query):
+    if query.isdigit():
+        return session.query(Card).filter(Card.id == int(query)).first()
+    return session.query(Card).filter(Card.name.ilike(f"%{query}%")).first()
+
+def get_users_with_card(session, card_id):
+    result = (
+        session.query(User, UserCard)
+        .join(UserCard)
+        .filter(UserCard.card_id == card_id)
+        .order_by(UserCard.count.desc())
+        .limit(15)
+        .all()
+    )
+    return result
+
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.callback_data import CallbackData
+from utils import find_card_by_id_or_name, get_users_with_card
+
+whohave_cb = CallbackData("whohave", "card_id")
+
+@dp.message_handler(commands=["search"])
+async def cmd_search(message: types.Message):
+    args = message.get_args()
+    if not args:
+        return await message.reply("Please provide a card name or ID.\nUsage: /search [name or ID]")
+
+    session = Session()
+    card = find_card_by_id_or_name(session, args.strip())
+    if not card:
+        return await message.reply("Card not found.")
+
+    keyboard = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("👥 Who Have?", callback_data=whohave_cb.new(card_id=card.id))
+    )
+
+    caption = f"🆔 ID: {card.id}\n👤 Name: {card.name}\n📺 Anime: {card.anime}\n🌟 Rarity: {rarity_emoji.get(card.rarity, '')}{card.rarity}"
+    if card.image_file_id:
+        await message.reply_photo(photo=card.image_file_id, caption=caption, reply_markup=keyboard)
+    elif card.video_file_id:
+        await message.reply_video(video=card.video_file_id, caption=caption, reply_markup=keyboard)
+    else:
+        await message.reply("Card media not found.")
+    session.close()
+
+@dp.callback_query_handler(whohave_cb.filter())
+async def who_have_callback(query: types.CallbackQuery, callback_data: dict):
+    card_id = int(callback_data["card_id"])
+    session = Session()
+    users = get_users_with_card(session, card_id)
+
+    if not users:
+        return await query.answer("Nobody owns this card yet.")
+
+    lines = []
+    for i, (user, uc) in enumerate(users, 1):
+        lines.append(f"{i}. {user.display_name or user.username or user.telegram_id} (x{uc.count})\nID: {user.telegram_id}")
+
+    text = "\n".join(lines)
+    await query.message.reply(f"👥 Users who own this card:\n\n{text}")
+    session.close()
+
+# utils.py
+def user_has_card(session, user_id, card_id):
+    return session.query(UserCard).filter_by(user_id=user_id, card_id=card_id).first()
+
+def transfer_card(session, from_user_id, to_user_id, card_id):
+    sender_card = session.query(UserCard).filter_by(user_id=from_user_id, card_id=card_id).first()
+    if sender_card:
+        sender_card.count -= 1
+        if sender_card.count <= 0:
+            session.delete(sender_card)
+        receiver_card = session.query(UserCard).filter_by(user_id=to_user_id, card_id=card_id).first()
+        if receiver_card:
+            receiver_card.count += 1
+        else:
+            session.add(UserCard(user_id=to_user_id, card_id=card_id, count=1))
+        session.commit()
+        return True
+    return False
+
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.callback_data import CallbackData
+from utils import user_has_card, transfer_card
+
+gift_cb = CallbackData("gift", "from_id", "to_id", "card_id")
+
+@dp.message_handler(commands=["gift"])
+async def cmd_gift(message: types.Message):
+    args = message.get_args().strip()
+    if not message.reply_to_message:
+        return await message.reply("You must reply to a user's message to gift a card.")
+
+    to_id = message.reply_to_message.from_user.id
+    from_id = message.from_user.id
+
+    if not args.isdigit():
+        return await message.reply("Please provide a valid card ID.\nUsage: /gift [card_id]")
+
+    card_id = int(args)
+    session = Session()
+    if not user_has_card(session, from_id, card_id):
+        session.close()
+        return await message.reply("You don't have this card.")
+
+    confirm_btn = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("✅ Confirm Gift", callback_data=gift_cb.new(from_id=from_id, to_id=to_id, card_id=card_id))
+    )
+    await message.reply(f"Are you sure you want to gift card ID {card_id} to this user?", reply_markup=confirm_btn)
+    session.close()
+
+@dp.callback_query_handler(gift_cb.filter())
+async def confirm_gift_callback(query: types.CallbackQuery, callback_data: dict):
+    from_id = int(callback_data["from_id"])
+    to_id = int(callback_data["to_id"])
+    card_id = int(callback_data["card_id"])
+
+    if query.from_user.id != from_id:
+        return await query.answer("Only the sender can confirm this gift.", show_alert=True)
+
+    session = Session()
+    success = transfer_card(session, from_id, to_id, card_id)
+    session.close()
+
+    if success:
+        await query.message.edit_text("🎁 Card gifted successfully.")
+    else:
+        await query.message.edit_text("⚠️ Failed to transfer card. Maybe you no longer have it.")
+
+def confirm_trade(session, user1_id, user2_id, card1_id, card2_id):
+    uc1 = session.query(UserCard).filter_by(user_id=user1_id, card_id=card1_id).first()
+    uc2 = session.query(UserCard).filter_by(user_id=user2_id, card_id=card2_id).first()
+    if not uc1 or not uc2:
+        return False
+
+    # کم کردن از اولی
+    uc1.count -= 1
+    if uc1.count <= 0:
+        session.delete(uc1)
+    
+    # اضافه کردن به دومی
+    uc1r = session.query(UserCard).filter_by(user_id=user2_id, card_id=card1_id).first()
+    if uc1r:
+        uc1r.count += 1
+    else:
+        session.add(UserCard(user_id=user2_id, card_id=card1_id, count=1))
+
+    # کم کردن از دومی
+    uc2.count -= 1
+    if uc2.count <= 0:
+        session.delete(uc2)
+    
+    # اضافه کردن به اولی
+    uc2r = session.query(UserCard).filter_by(user_id=user1_id, card_id=card2_id).first()
+    if uc2r:
+        uc2r.count += 1
+    else:
+        session.add(UserCard(user_id=user1_id, card_id=card2_id, count=1))
+
+    session.commit()
+    return True
+
+from utils import confirm_trade
+from aiogram.utils.callback_data import CallbackData
+
+trade_cb = CallbackData("trade", "from_id", "to_id", "card1_id", "card2_id")
+
+@dp.message_handler(commands=["trade"])
+async def cmd_trade(message: types.Message):
+    args = message.get_args().split()
+    if not message.reply_to_message or len(args) != 2:
+        return await message.reply("Usage:\n/reply to a user\n/trade [your_card_id] [their_card_id]")
+
+    from_id = message.from_user.id
+    to_id = message.reply_to_message.from_user.id
+
+    if not all(arg.isdigit() for arg in args):
+        return await message.reply("Card IDs must be numbers.")
+
+    card1_id, card2_id = map(int, args)
+    session = Session()
+
+    has_from = user_has_card(session, from_id, card1_id)
+    has_to = user_has_card(session, to_id, card2_id)
+
+    if not has_from:
+        session.close()
+        return await message.reply("You don't own the card you're offering.")
+    if not has_to:
+        session.close()
+        return await message.reply("The other user doesn't own the card you're asking for.")
+
+    session.close()
+    keyboard = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("✅ Accept Trade", callback_data=trade_cb.new(
+            from_id=from_id, to_id=to_id, card1_id=card1_id, card2_id=card2_id
+        ))
+    )
+    await message.reply(
+        f"{message.reply_to_message.from_user.first_name}, do you accept the trade?\n"
+        f"You'll give card ID {card2_id} and get card ID {card1_id}.",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query_handler(trade_cb.filter())
+async def accept_trade(query: types.CallbackQuery, callback_data: dict):
+    from_id = int(callback_data["from_id"])
+    to_id = int(callback_data["to_id"])
+    card1_id = int(callback_data["card1_id"])
+    card2_id = int(callback_data["card2_id"])
+
+    if query.from_user.id != to_id:
+        return await query.answer("Only the user being traded with can accept.", show_alert=True)
+
+    session = Session()
+    success = confirm_trade(session, from_id, to_id, card1_id, card2_id)
+    session.close()
+
+    if success:
+        await query.message.edit_text("✅ Trade completed successfully!")
+    else:
+        await query.message.edit_text("⚠️ Trade failed. One of the cards is missing.")
+
+@dp.message_handler(commands=["show"])
+async def cmd_show(message: types.Message):
+    args = message.get_args().strip()
+    if not args.isdigit():
+        return await message.reply("Usage: /show [card_id]")
+
+    card_id = int(args)
+    session = Session()
+    card = session.query(Card).filter_by(id=card_id).first()
+
+    if not card:
+        session.close()
+        return await message.reply("❌ Card not found.")
+
+    # چک مالکیت
+    has_card = user_has_card(session, message.from_user.id, card_id)
+
+    caption = f"🆔 ID: {card.id}\n" \
+              f"🧬 Name: {card.name}\n" \
+              f"📺 Anime: {card.anime}\n" \
+              f"🎖️ Rarity: {rarity_emojis.get(card.rarity, '')} {card.rarity}\n" \
+              f"👤 Owned by you: {'✅ Yes' if has_card else '❌ No'}"
+
+    if card.is_video:
+        await message.reply_video(card.file_id, caption=caption)
+    else:
+        await message.reply_photo(card.file_id, caption=caption)
+
+    session.close()
+
+# rarity_emojis = {rarity: emoji}
+rarity_emojis = {
     "common": "⚪️", "uncommon": "🟣", "rare": "🟠",
     "legendary": "🟡", "history": "🔱", "divine": "🌟",
     "exotic": "💎", "edit": "✨"
 }
 
-def pick_rarity():
-    roll = random.randint(1, 100)
-    current = 0
-    for rarity, chance in RARITY_CHANCES.items():
-        current += chance
-        if roll <= current:
-            return rarity
-    return "common"
+@dp.message_handler(commands=["top_harem"])
+async def cmd_top_harem(message: types.Message):
+    session = Session()
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    now = time.time()
-
-    # اسپمر چک نشه اگر از قبل بنه
-    if user_id in soft_banned_users and soft_banned_users[user_id] > now:
-        return
-
-    # لاگ پیام‌ها برای چت و کاربر
-    if chat_id not in message_log:
-        message_log[chat_id] = {}
-    if user_id not in message_log[chat_id]:
-        message_log[chat_id][user_id] = []
-    message_log[chat_id][user_id].append(now)
-
-    # پاکسازی لاگ‌های قدیمی‌تر از 10 ثانیه
-    message_log[chat_id][user_id] = [t for t in message_log[chat_id][user_id] if now - t <= 10]
-
-    # بررسی شرط اسپم (۶ پیام متوالی یا ۴ پیام در ۸ ثانیه)
-    if len(message_log[chat_id][user_id]) >= 6 or (len(message_log[chat_id][user_id]) >= 4 and now - message_log[chat_id][user_id][0] <= 8):
-        soft_banned_users[user_id] = now + 20 * 60
-        await update.message.reply_text("❌ You are soft-banned for spamming for 20 minutes.")
-        return
-
-    # شمارش پیام برای چت خاص
-    if chat_id not in chat_message_count:
-        chat_message_count[chat_id] = 0
-    chat_message_count[chat_id] += 1
-
-    # هر ۱۰۰ پیام یک کارت دراپ بشه
-    if chat_message_count[chat_id] % 100 == 0:
-        await drop_card(chat_id, context)
-
-async def drop_card(chat_id, context):
-    # کارت شانسی بر اساس ریرتی انتخاب میشه
-    rarity = pick_rarity()
-    # دیتابیس کارت‌ها در context.bot_data فرض شده {'cards': [{...}]}
-    cards = context.bot_data.get("cards", [])
-    rarity_cards = [c for c in cards if c["rarity"] == rarity]
-
-    if not rarity_cards:
-        return
-
-    card = random.choice(rarity_cards)
-    name, anime, media_type, media_id = card["name"], card["anime"], card["type"], card["file_id"]
-    caption = f"{RARITY_EMOJIS[rarity]} ᴀ ᴄʜᴀʀᴀᴄᴛᴇʀ ʜᴀs sᴘᴀᴡɴᴇᴅ ɪɴ ᴛʜᴇ ᴄʜᴀᴛ!\nᴀᴅᴅ ᴛʜɪs ᴄʜᴀʀᴀᴄᴛᴇʀ ᴛᴏ ʏᴏᴜʀ ʜᴀʀᴇᴍ ᴜsɪɴɢ /get {name}"
-
-    if media_type == "photo":
-        await context.bot.send_photo(chat_id=chat_id, photo=media_id, caption=caption)
-    elif media_type == "video":
-        await context.bot.send_video(chat_id=chat_id, video=media_id, caption=caption)
-
-    # ذخیره کارت دراپ‌شده
-    context.chat_data["last_drop"] = {"name": name, "anime": anime, "rarity": rarity, "claimed": False}
-    context.chat_data["drop_user"] = None
-
-from telegram import Update
-from telegram.ext import ContextTypes
-from utils.db import get_card_by_name, add_card_to_user, is_user_banned, mark_card_as_claimed
-from utils.format import format_claim_message
-
-# Handler for /get command
-async def get_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    user_id = update.message.from_user.id
-    chat_id = update.message.chat_id
-
-    # Check if user is banned
-    if await is_user_banned(user_id):
-        await update.message.reply_text("🚫 You are banned.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Please use: /get [name]")
-        return
-
-    card_name = " ".join(context.args).strip().lower()
-
-    # Try to fetch the dropped card
-    dropped_card = await get_card_by_name(chat_id, card_name)
-
-    if not dropped_card:
-        await update.message.reply_text("❌ No such card is currently dropped in this chat.")
-        return
-
-    if dropped_card.claimed:
-        await update.message.reply_text("❌ This card has already been claimed.")
-        return
-
-    # Mark card as claimed
-    await mark_card_as_claimed(chat_id, dropped_card.card_id)
-
-    # Add card to user's harem
-    await add_card_to_user(user_id, dropped_card.card_id)
-
-    # Send confirmation message
-    formatted_msg = format_claim_message(dropped_card.name, dropped_card.anime, dropped_card.rarity)
-    await update.message.reply_text(f"✅ You got it!\n{formatted_msg}")
-
-
-import random
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CallbackContext
-from utils import is_banned, get_user_cards, add_card_to_user, get_card_by_name, get_card_by_id, card_exists
-
-# Search command handler
-def search_command(update: Update, context: CallbackContext):
-    if is_banned(update.effective_user.id):
-        update.message.reply_text("You are banned")
-        return
-
-    if not context.args:
-        update.message.reply_text("Please provide a card name or ID to search.")
-        return
-
-    query = " ".join(context.args)
-
-    results = []
-    if query.isdigit():
-        card = get_card_by_id(int(query))
-        if card:
-            results.append(card)
-    else:
-        card = get_card_by_name(query)
-        if card:
-            results.append(card)
+    # شمارش تعداد کارت‌ها برای هر کاربر
+    results = session.query(
+        UserCard.user_id,
+        func.count(UserCard.card_id).label("unique_cards"),
+        func.sum(UserCard.count).label("total_cards")
+    ).group_by(UserCard.user_id).order_by(
+        func.count(UserCard.card_id).desc(), func.sum(UserCard.count).desc()
+    ).limit(10).all()
 
     if not results:
-        update.message.reply_text("No card found with that name or ID.")
-        return
-
-    for card in results:
-        text = f"Name: {card['name']}\nAnime: {card['anime']}\nRarity: {card['rarity_emoji']} {card['rarity']}"
-        have_button = [[InlineKeyboardButton("Who Have?", callback_data=f"whohave_{card['id']}")]]
-        reply_markup = InlineKeyboardMarkup(have_button)
-
-        if card['file_type'] == 'photo':
-            update.message.reply_photo(photo=card['file_id'], caption=text, reply_markup=reply_markup)
-        elif card['file_type'] == 'video':
-            update.message.reply_video(video=card['file_id'], caption=text, reply_markup=reply_markup)
-
-# Callback handler for "Who Have?"
-def who_have_callback(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    data = query.data.split("_")
-    if len(data) < 2:
-        return
-
-    card_id = int(data[1])
-    owners = get_user_cards(card_id=card_id, show_all=True)
-    if not owners:
-        query.edit_message_text("No one owns this card yet.")
-        return
-
-    message = f"Users who have card ID {card_id}:\n"
-    for user in owners[:15]:
-        message += f"- {user['username']} (ID: {user['user_id']}) x{user['count']}\n"
-
-    query.edit_message_text(message)
-
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ContextTypes, ConversationHandler
-
-CONFIRM_GIFT = range(1)
-
-user_gift_requests = {}  # {user_id: {'card_id': int, 'to_user_id': int}}
-
-async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("❌ باید روی پیام فردی که می‌خواهید کارت را به او بدهید ریپلای کنید.")
-        return
-
-    from_user_id = update.message.from_user.id
-    to_user_id = update.message.reply_to_message.from_user.id
-
-    if not context.args:
-        await update.message.reply_text("❌ لطفاً آیدی کارت را وارد کنید. مثل: /gift 12")
-        return
-
-    try:
-        card_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ آیدی کارت باید عدد باشد.")
-        return
-
-    # بررسی مالکیت کارت
-    if user_cards.get(from_user_id, {}).get(card_id, 0) == 0:
-        await update.message.reply_text("❌ شما این کارت را ندارید.")
-        return
-
-    user_gift_requests[from_user_id] = {'card_id': card_id, 'to_user_id': to_user_id}
-    await update.message.reply_text("⚠️ آیا مطمئن هستید که می‌خواهید این کارت را هدیه دهید؟ پاسخ دهید با: تایید")
-    return CONFIRM_GIFT
-
-async def confirm_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    text = update.message.text.lower()
-
-    if text != "تایید":
-        await update.message.reply_text("❌ عملیات لغو شد.")
-        user_gift_requests.pop(user_id, None)
-        return ConversationHandler.END
-
-    data = user_gift_requests.get(user_id)
-    if not data:
-        await update.message.reply_text("❌ اطلاعاتی برای تایید پیدا نشد.")
-        return ConversationHandler.END
-
-    card_id = data['card_id']
-    to_user_id = data['to_user_id']
-
-    # انتقال کارت
-    user_cards[user_id][card_id] -= 1
-    if user_cards[user_id][card_id] == 0:
-        del user_cards[user_id][card_id]
-
-    user_cards.setdefault(to_user_id, {}).setdefault(card_id, 0)
-    user_cards[to_user_id][card_id] += 1
-
-    await update.message.reply_text("✅ کارت با موفقیت هدیه داده شد.")
-    user_gift_requests.pop(user_id, None)
-    return ConversationHandler.END
-
-gift_handler = ConversationHandler(
-    entry_points=[CommandHandler("gift", gift_command)],
-    states={
-        CONFIRM_GIFT: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_gift)],
-    },
-    fallbacks=[],
-)
-
-application.add_handler(gift_handler)
-
-
-from telegram import Update
-from telegram.ext import ContextTypes, ConversationHandler, MessageHandler, filters
-
-TRADE_CONFIRM_USER1, TRADE_CONFIRM_USER2 = range(2)
-pending_trades = {}  # user_id -> {'with': user_id, 'your_card': int, 'their_card': int}
-
-async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("❌ باید روی پیام طرف مقابل ریپلای کنید.")
-        return ConversationHandler.END
-
-    user1 = update.message.from_user
-    user2 = update.message.reply_to_message.from_user
-
-    if user1.id == user2.id:
-        await update.message.reply_text("❌ نمی‌توانید با خودتان معامله کنید.")
-        return ConversationHandler.END
-
-    if len(context.args) != 2:
-        await update.message.reply_text("❌ فرمت صحیح: /trade [کارت شما] [کارت طرف مقابل]")
-        return ConversationHandler.END
-
-    try:
-        user1_card = int(context.args[0])
-        user2_card = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("❌ آیدی کارت‌ها باید عدد باشند.")
-        return ConversationHandler.END
-
-    if user_cards.get(user1.id, {}).get(user1_card, 0) == 0:
-        await update.message.reply_text("❌ شما کارت شماره {} را ندارید.".format(user1_card))
-        return ConversationHandler.END
-
-    if user_cards.get(user2.id, {}).get(user2_card, 0) == 0:
-        await update.message.reply_text("❌ طرف مقابل کارت شماره {} را ندارد.".format(user2_card))
-        return ConversationHandler.END
-
-    # ذخیره معامله موقت
-    pending_trades[user1.id] = {
-        'with': user2.id,
-        'your_card': user1_card,
-        'their_card': user2_card,
-        'confirmed': {user1.id: False, user2.id: False}
-    }
-
-    await update.message.reply_text("🔁 درخواست تبادل ثبت شد. حالا در چت خصوصی با ربات تایپ کن: تایید")
-    return TRADE_CONFIRM_USER1
-
-async def confirm_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    text = update.message.text.strip().lower()
-
-    if text != "تایید":
-        await update.message.reply_text("❌ تبادل لغو شد.")
-        pending_trades.pop(user_id, None)
-        return ConversationHandler.END
-
-    # بررسی اینکه طرف مقابل معامله کیه
-    trade = pending_trades.get(user_id)
-    if not trade:
-        # شاید این نفر دوم معامله است
-        for t_user, data in pending_trades.items():
-            if data['with'] == user_id:
-                trade = data
-                break
-        else:
-            await update.message.reply_text("❌ هیچ معامله‌ای برای تایید پیدا نشد.")
-            return ConversationHandler.END
-
-    user1_id = user_id if user_id in trade['confirmed'] else trade['with']
-    user2_id = trade['with'] if user_id == user1_id else user_id
-
-    trade['confirmed'][user_id] = True
-
-    # اگر هر دو تایید کردند:
-    if all(trade['confirmed'].values()):
-        user1_card = trade['your_card']
-        user2_card = trade['their_card']
-
-        # انتقال کارت‌ها
-        user_cards[user1_id][user1_card] -= 1
-        if user_cards[user1_id][user1_card] == 0:
-            del user_cards[user1_id][user1_card]
-
-        user_cards[user2_id][user2_card] -= 1
-        if user_cards[user2_id][user2_card] == 0:
-            del user_cards[user2_id][user2_card]
-
-        user_cards.setdefault(user1_id, {}).setdefault(user2_card, 0)
-        user_cards[user1_id][user2_card] += 1
-
-        user_cards.setdefault(user2_id, {}).setdefault(user1_card, 0)
-        user_cards[user2_id][user1_card] += 1
-
-        await update.message.reply_text("✅ تبادل موفقیت‌آمیز بود!")
-        pending_trades.pop(user1_id, None)
-    else:
-        await update.message.reply_text("✅ تایید شما ثبت شد. منتظر تایید طرف مقابل هستیم...")
-
-    return ConversationHandler.END
-
-
-trade_handler = ConversationHandler(
-    entry_points=[CommandHandler("trade", trade_command)],
-    states={
-        TRADE_CONFIRM_USER1: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_trade)],
-    },
-    fallbacks=[],
-)
-
-application.add_handler(trade_handler)
-
-
-@bot.on_message(filters.command("show") & filters.private | filters.group)
-async def show_card_command(client, message):
-    if len(message.command) != 2:
-        await message.reply("❌ فرمت صحیح: /show [آیدی کارت]")
-        return
-
-    try:
-        card_id = int(message.command[1])
-    except ValueError:
-        await message.reply("❌ آیدی کارت باید عدد باشد.")
-        return
-
-    card = cards_db.get(card_id)
-    if not card:
-        await message.reply("❌ چنین کارتی پیدا نشد.")
-        return
-
-    rarity_emoji = rarity_emojis.get(card["rarity"], "❔")
-    caption = f"""
-{rarity_emoji} <b>{card['name']}</b>
-🎞 Anime: <b>{card['anime']}</b>
-⭐ Rarity: <b>{card['rarity']}</b>
-"""
-
-    # بررسی مالکیت
-    user_id = message.from_user.id
-    has_card = user_cards.get(user_id, {}).get(card_id, 0) > 0
-    caption += "\n✅ <b>شما این کارت را دارید</b>" if has_card else "\n❌ <b>شما این کارت را ندارید</b>"
-
-    if card["file_type"] == "video":
-        await message.reply_video(card["file_id"], caption=caption, parse_mode="HTML")
-    else:
-        await message.reply_photo(card["file_id"], caption=caption, parse_mode="HTML")
-
-cards_db = {
-    1: {
-        "name": "Eren",
-        "anime": "Attack on Titan",
-        "rarity": "legendary",
-        "file_id": "ABC123",  # File ID از تلگرام
-        "file_type": "photo"  # یا "video"
-    },
-    ...
-}
-
-user_cards = {
-    123456: {  # user_id
-        1: 1,   # card_id: count
-        2: 1
-    },
-}
-
-@bot.on_message(filters.command("top_harem") & filters.private | filters.group)
-async def top_harem(client, message):
-    # ساخت لیست رتبه‌بندی
-    leaderboard = []
-    for user_id, cards in user_cards.items():
-        total_cards = sum(cards.values())
-        if total_cards > 0:
-            leaderboard.append((user_id, total_cards))
-
-    if not leaderboard:
-        await message.reply("❌ هنوز هیچ کاربری کارتی نداره.")
-        return
-
-    # مرتب‌سازی نزولی
-    leaderboard.sort(key=lambda x: x[1], reverse=True)
-    top_10 = leaderboard[:10]
-
-    response = "<b>🏆 Top Harem Users</b>\n\n"
-    for i, (user_id, total) in enumerate(top_10, start=1):
+        session.close()
+        return await message.reply("هیچ کاربری هنوز کارتی نداره.")
+
+    text = "🏆 Top 10 Harems:\n\n"
+    for idx, row in enumerate(results, 1):
+        user_id = row.user_id
         try:
-            user = await client.get_users(user_id)
-            name = user.first_name
+            user = await bot.get_chat(user_id)
+            name = user.full_name
         except:
-            name = f"User({user_id})"
-        response += f"{i}. {name} — <b>{total}</b> cards\n"
+            name = f"User {user_id}"
 
-    await message.reply(response, parse_mode="HTML")
+        text += f"{idx}. {name} — {row.unique_cards} cards ({row.total_cards} total)\n"
 
-user_cards = {
-    123456: {1: 2, 2: 1, 3: 1},  # user_id: {card_id: count}
-    789012: {1: 3}
-}
-🏆 Top Harem Users
+    session.close()
+    await message.reply(text)
 
-1. Armg — 42 cards
-2. Rashid — 38 cards
-3. Hadi — 33 cards
-...
+@dp.message_handler(commands=["help"])
+async def cmd_help(message: types.Message):
+    help_text = """
+📖 <b>User Commands</b>:
+
+🎴 /get [name]
+دریافت کارتی که در چت اسپاون شده
+
+👘 /harem
+دیدن کارت‌های شما
+
+🔎 /search [name or id]
+جستجوی کارت در دیتابیس
+
+🎁 /gift [card_id] (ریپلای)
+هدیه دادن کارت به شخصی دیگر
+
+🔄 /trade [your_card_id] [their_card_id] (ریپلای)
+مبادله کارت با دیگران با تأیید دو طرف
+
+🖼 /show [id]
+نمایش کارت خاص با جزئیات
+
+🏆 /top_harem
+نمایش ۱۰ نفر اول با بیشترین کارت
+
+❓ /help
+نمایش این لیست
+"""
+    await message.reply(help_text, parse_mode="HTML")
+
+@dp.message_handler(commands=["help_admins"])
+async def cmd_help_admins(message: types.Message):
+    session = Session()
+    user_id = message.from_user.id
+    user = session.query(User).filter_by(user_id=user_id).first()
+    session.close()
+
+    if not user or (not user.is_admin and not user.is_owner):
+        return await message.reply("⛔️ فقط ادمین‌ها و مالک می‌تونن این دستور رو اجرا کنن.")
+
+    help_text = """
+🛠 <b>Admin Commands</b>:
+
+➕ /add_card
+افزودن کارت جدید مرحله‌به‌مرحله (نام، انیمه، ریرتی، عکس/ویدیو)
+
+🗑 /del_card [id]
+حذف کامل کارت از دیتابیس و همه کاربران
+
+🆔 /edit_id [id]
+تغییر آی‌دی کارت (اگر تکراری نباشد)
+
+🎁 /ggrant [id] (ریپلای)
+دادن کارت به کاربر موردنظر
+
+📈 /increase [num] (ریپلای یا user_id)
+دادن تصادفی n کارت به کاربر
+
+📉 /reduce [num] (ریپلای یا user_id)
+حذف تصادفی n کارت از کاربر
+
+🚫 /bang (ریپلای یا user_id)
+بی‌اثر کردن پیام‌ها و دستورات کاربر (موقتی)
+
+✅ /unbang (ریپلای یا user_id)
+خارج کردن کاربر از حالت بنگ
+
+📃 /list_bang
+نمایش لیست کاربران بنگ شده
+
+📄 /list_cards
+لیست کامل کارت‌ها (id، نام، انیمه)
+
+📊 /card_stats [id]
+نمایش آمار دارندگان کارت مشخص
+
+📖 /help_admins
+نمایش همین لیست
+
+👑 دستورات مالک هم از طریق /help_owner یا لیست بالا اضافه میشه.
+"""
+    await message.reply(help_text, parse_mode="HTML")
+
+@dp.message_handler(commands=["help_owner"])
+async def cmd_help_owner(message: types.Message):
+    session = Session()
+    user_id = message.from_user.id
+    user = session.query(User).filter_by(user_id=user_id).first()
+    session.close()
+
+    if not user or not user.is_owner:
+        return await message.reply("⛔️ فقط مالک ربات می‌تونه این دستور رو اجرا کنه.")
+
+    help_text = """
+👑 <b>Owner Commands</b>:
+
+👮 /add_admin (ریپلای یا user_id)
+تبدیل کاربر به ادمین
+
+👋 /remove_admin (ریپلای یا user_id)
+حذف ادمین از لیست
+
+📃 /list_admin
+نمایش لیست تمام ادمین‌ها
+
+🗑 /delete_card [user_id] [card_id] (یا ریپلای)
+حذف یک کارت خاص از حارم یک کاربر
+
+🔁 /transfer [from_user_id] [to_user_id]
+انتقال کامل حارم یک کاربر به دیگری
+
+🧠 /help_owner
+نمایش همین لیست
+"""
+    await message.reply(help_text, parse_mode="HTML")
+
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram import types
+from loader import dp
+from database import Session, Card, User
+from utils.misc.rarity import valid_rarities
+
+class AddCard(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_anime = State()
+    waiting_for_rarity = State()
+    waiting_for_media = State()
+
+@dp.message_handler(commands=['add_card'])
+async def start_add_card(message: types.Message):
+    session = Session()
+    user = session.query(User).filter_by(user_id=message.from_user.id).first()
+    session.close()
+
+    if not user or not (user.is_admin or user.is_owner):
+        return await message.reply("⛔️ فقط ادمین‌ها یا مالک می‌تونن این دستور رو بزنن.")
+    
+    await message.reply("👤 لطفاً اسم کاراکتر رو وارد کن:")
+    await AddCard.waiting_for_name.set()
+
+@dp.message_handler(state=AddCard.waiting_for_name)
+async def get_card_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.reply("🎬 لطفاً اسم انیمه رو وارد کن:")
+    await AddCard.waiting_for_anime.set()
+
+@dp.message_handler(state=AddCard.waiting_for_anime)
+async def get_anime_name(message: types.Message, state: FSMContext):
+    await state.update_data(anime=message.text)
+    await message.reply("📊 لطفاً رریتی کارت رو وارد کن (مثلاً: common، rare، exotic):")
+    await AddCard.waiting_for_rarity.set()
+
+@dp.message_handler(state=AddCard.waiting_for_rarity)
+async def get_rarity(message: types.Message, state: FSMContext):
+    rarity = message.text.lower()
+    if rarity not in valid_rarities:
+        return await message.reply("⛔️ رریتی نامعتبر. لطفاً یکی از اینها رو وارد کن:\n" + ", ".join(valid_rarities))
+    await state.update_data(rarity=rarity)
+    await message.reply("📷 لطفاً عکس یا ویدیو کارت را ارسال کن:")
+    await AddCard.waiting_for_media.set()
+
+@dp.message_handler(state=AddCard.waiting_for_media, content_types=['photo', 'video'])
+async def get_media(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+
+    session = Session()
+    last_card = session.query(Card).order_by(Card.id.desc()).first()
+    card_id = 1 if not last_card else last_card.id + 1
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        media_type = 'photo'
+    else:
+        file_id = message.video.file_id
+        media_type = 'video'
+
+    new_card = Card(
+        id=card_id,
+        name=data['name'],
+        anime=data['anime'],
+        rarity=data['rarity'],
+        media_type=media_type,
+        file_id=file_id
+    )
+
+    session.add(new_card)
+    session.commit()
+    session.close()
+
+    await message.reply(f"✅ کارت با موفقیت اضافه شد!\nID: <code>{card_id}</code>", parse_mode="HTML")
+    await state.finish()
+
+# models.py
+class Card(Base):
+    __tablename__ = "cards"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    anime = Column(String)
+    rarity = Column(String)
+    media_type = Column(String)  # 'photo' یا 'video'
+    file_id = Column(String)
+
+valid_rarities = [
+    "common", "uncommon", "rare", "legendary",
+    "history", "divine", "exotic", "edit"
+]
+
+
 
 
     
